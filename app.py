@@ -3,11 +3,12 @@ import requests
 import sqlite3
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+from flask_socketio import SocketIO, emit
 from dotenv import load_dotenv
 from datetime import datetime
 import threading
 import json
-import base64
+import mimetypes
 from werkzeug.utils import secure_filename
 import csv
 from io import StringIO, BytesIO
@@ -15,7 +16,9 @@ from io import StringIO, BytesIO
 load_dotenv()
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = os.urandom(24)
 CORS(app, resources={r"/*": {"origins": "*"}})
+socketio = SocketIO(app, cors_allowed_origins="*", ping_timeout=60, ping_interval=25)
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
@@ -26,14 +29,14 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 MEDIA_FOLDER = "media_files"
 os.makedirs(MEDIA_FOLDER, exist_ok=True)
 app.config['MEDIA_FOLDER'] = MEDIA_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'pdf', 'doc', 'docx', 'mp3', 'mp4', 'txt'}
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'pdf', 'doc', 'docx', 'mp3', 'mp4', 'txt', 'webp', 'mp4', 'mov'}
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 # =========================
-# DATABASE - UPDATED
+# DATABASE
 # =========================
 
 def get_db():
@@ -45,7 +48,6 @@ def init_db():
     conn = get_db()
     cursor = conn.cursor()
     
-    # Users table with additional fields
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS users (
         phone TEXT PRIMARY KEY,
@@ -58,7 +60,6 @@ def init_db():
     )
     """)
     
-    # Messages table with media support
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,52 +69,11 @@ def init_db():
         status TEXT DEFAULT 'sent',
         timestamp TEXT,
         message_type TEXT DEFAULT 'text',
-        media_url TEXT,
         media_path TEXT,
-        media_mime_type TEXT,
-        file_name TEXT
+        file_name TEXT,
+        whatsapp_message_id TEXT
     )
     """)
-    
-    # Analytics table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS analytics (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT,
-        total_messages INTEGER DEFAULT 0,
-        unique_users INTEGER DEFAULT 0,
-        avg_response_time REAL DEFAULT 0
-    )
-    """)
-    
-    # Add new columns if they don't exist
-    try:
-        cursor.execute("ALTER TABLE users ADD COLUMN tags TEXT DEFAULT ''")
-    except: pass
-    try:
-        cursor.execute("ALTER TABLE users ADD COLUMN notes TEXT DEFAULT ''")
-    except: pass
-    try:
-        cursor.execute("ALTER TABLE users ADD COLUMN total_messages INTEGER DEFAULT 0")
-    except: pass
-    try:
-        cursor.execute("ALTER TABLE users ADD COLUMN last_seen TEXT")
-    except: pass
-    try:
-        cursor.execute("ALTER TABLE messages ADD COLUMN message_type TEXT DEFAULT 'text'")
-    except: pass
-    try:
-        cursor.execute("ALTER TABLE messages ADD COLUMN media_url TEXT")
-    except: pass
-    try:
-        cursor.execute("ALTER TABLE messages ADD COLUMN media_path TEXT")
-    except: pass
-    try:
-        cursor.execute("ALTER TABLE messages ADD COLUMN media_mime_type TEXT")
-    except: pass
-    try:
-        cursor.execute("ALTER TABLE messages ADD COLUMN file_name TEXT")
-    except: pass
     
     conn.commit()
     conn.close()
@@ -148,13 +108,18 @@ def get_relevant_knowledge(msg):
     return "\n".join(matched)[:800]
 
 # =========================
-# SAVE FUNCTIONS
+# SAVE FUNCTIONS WITH SOCKET EMITS
 # =========================
 
 def save_user(phone):
     conn = get_db()
     cursor = conn.cursor()
+    is_new = False
     try:
+        cursor.execute("SELECT phone FROM users WHERE phone=?", (phone,))
+        existing = cursor.fetchone()
+        is_new = existing is None
+        
         cursor.execute(
             "INSERT OR IGNORE INTO users (phone, first_seen, last_seen) VALUES (?, ?, ?)",
             (phone, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -164,48 +129,118 @@ def save_user(phone):
             (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), phone)
         )
         conn.commit()
+        
+        if is_new:
+            cursor.execute("SELECT * FROM users WHERE phone=?", (phone,))
+            user_data = cursor.fetchone()
+            socketio.emit('new_user', {
+                'phone': user_data["phone"],
+                'human_mode': user_data["human_mode"],
+                'total_messages': 0,
+                'last': 'New user'
+            })
+            print(f"🆕 New user joined: {phone}")
+            
     except Exception as e:
         print(f"Error saving user: {e}")
     finally:
         conn.close()
 
-def save_message(phone, message, direction, status="sent", message_type="text", media_path=None, media_mime_type=None, file_name=None):
+def save_message(phone, message, direction, status="sent", message_type="text", media_path=None, file_name=None, whatsapp_message_id=None):
     conn = get_db()
     cursor = conn.cursor()
     try:
         cursor.execute(
             """INSERT INTO messages 
-               (phone, message, direction, status, timestamp, message_type, media_path, media_mime_type, file_name) 
+               (phone, message, direction, status, timestamp, message_type, media_path, file_name, whatsapp_message_id) 
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (phone, message, direction, status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
-             message_type, media_path, media_mime_type, file_name)
+             message_type, media_path, file_name, whatsapp_message_id)
         )
+        msg_id = cursor.lastrowid
         conn.commit()
         
         # Update user message count
         cursor.execute("UPDATE users SET total_messages = total_messages + 1 WHERE phone=?", (phone,))
+        cursor.execute("UPDATE users SET last_seen=? WHERE phone=?", (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), phone))
         conn.commit()
         
-        return cursor.lastrowid
+        # Get updated user data
+        cursor.execute("SELECT * FROM users WHERE phone=?", (phone,))
+        user_data = cursor.fetchone()
+        
+        # Emit message update via WebSocket
+        socketio.emit('new_message', {
+            'phone': phone,
+            'message': message,
+            'direction': direction,
+            'status': status,
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'message_type': message_type,
+            'file_name': file_name,
+            'msg_id': msg_id
+        })
+        
+        # Emit user update for sidebar
+        if user_data:
+            socketio.emit('user_update', {
+                'phone': user_data["phone"],
+                'human_mode': user_data["human_mode"],
+                'tags': user_data["tags"] or "",
+                'total_messages': user_data["total_messages"],
+                'last': message[:50] if message else "Sent a file",
+                'last_seen': user_data["last_seen"]
+            })
+        
+        return msg_id
     except Exception as e:
         print(f"Error saving message: {e}")
         return None
     finally:
         conn.close()
 
-def update_user_tags(phone, tags):
+def update_message_status(whatsapp_message_id, status):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("UPDATE users SET tags=? WHERE phone=?", (tags, phone))
-    conn.commit()
-    conn.close()
+    try:
+        cursor.execute(
+            "SELECT phone FROM messages WHERE whatsapp_message_id=?",
+            (whatsapp_message_id,)
+        )
+        result = cursor.fetchone()
+        
+        cursor.execute(
+            "UPDATE messages SET status=? WHERE whatsapp_message_id=?",
+            (status, whatsapp_message_id)
+        )
+        conn.commit()
+        
+        if result:
+            socketio.emit('status_update', {
+                'whatsapp_message_id': whatsapp_message_id,
+                'status': status,
+                'phone': result["phone"]
+            })
+        print(f"✅ Updated message {whatsapp_message_id} status to: {status}")
+    except Exception as e:
+        print(f"Error updating message status: {e}")
+    finally:
+        conn.close()
 
-def update_user_notes(phone, notes):
+def get_user_mode(phone):
+    """Get user's current mode"""
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("UPDATE users SET notes=? WHERE phone=?", (notes, phone))
-    conn.commit()
-    conn.close()
+    try:
+        cursor.execute("SELECT human_mode FROM users WHERE phone=?", (phone,))
+        row = cursor.fetchone()
+        mode = row[0] if row else 0
+        return mode
+    except Exception as e:
+        print(f"Error getting user mode: {e}")
+        return 0
+    finally:
+        conn.close()
 
 # =========================
 # SEND WHATSAPP MESSAGE
@@ -214,7 +249,7 @@ def update_user_notes(phone, notes):
 def send_message(to, message):
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
         print("❌ WhatsApp credentials missing")
-        return False
+        return False, None
     
     try:
         url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
@@ -233,26 +268,27 @@ def send_message(to, message):
         res = requests.post(url, headers=headers, json=data, timeout=10)
         
         if res.status_code == 200:
-            print(f"✅ Message sent to {to}")
-            return True
+            response_data = res.json()
+            whatsapp_msg_id = response_data.get('messages', [{}])[0].get('id')
+            print(f"✅ Message sent to {to}, ID: {whatsapp_msg_id}")
+            return True, whatsapp_msg_id
         else:
             print(f"❌ WhatsApp error {res.status_code}: {res.text}")
-            return False
+            return False, None
             
     except Exception as e:
         print(f"❌ Send error: {e}")
-        return False
+        return False, None
 
-def send_file_message(to, file_path, file_type="image"):
-    """Send a file/image to WhatsApp"""
+def send_file_message(to, file_path, file_type="image", caption=""):
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
-        return False
+        return False, None
     
     try:
-        # First, upload the file to WhatsApp servers
-        media_url = upload_media_to_whatsapp(file_path, file_type)
-        if not media_url:
-            return False
+        media_id = upload_media_to_whatsapp(file_path, file_type)
+        if not media_id:
+            print("❌ Failed to upload media")
+            return False, None
         
         url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
         headers = {
@@ -264,32 +300,48 @@ def send_file_message(to, file_path, file_type="image"):
             "messaging_product": "whatsapp",
             "to": to,
             "type": file_type,
-            file_type: {"link": media_url}
+            file_type: {"id": media_id}
         }
         
+        if caption:
+            data[file_type]["caption"] = caption
+        
+        print(f"📤 Sending {file_type} to {to}...")
         res = requests.post(url, headers=headers, json=data, timeout=30)
         
         if res.status_code == 200:
-            print(f"✅ {file_type} sent to {to}")
-            return True
+            response_data = res.json()
+            whatsapp_msg_id = response_data.get('messages', [{}])[0].get('id')
+            print(f"✅ {file_type} sent to {to}, ID: {whatsapp_msg_id}")
+            return True, whatsapp_msg_id
         else:
             print(f"❌ Failed to send {file_type}: {res.text}")
-            return False
+            return False, None
             
     except Exception as e:
         print(f"❌ Send file error: {e}")
-        return False
+        return False, None
 
 def upload_media_to_whatsapp(file_path, file_type):
-    """Upload media to WhatsApp servers"""
     try:
         url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/media"
         headers = {
             "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         }
         
+        mime_type, _ = mimetypes.guess_type(file_path)
+        if not mime_type:
+            if file_type == "image":
+                mime_type = "image/jpeg"
+            elif file_type == "audio":
+                mime_type = "audio/mpeg"
+            else:
+                mime_type = "application/pdf"
+        
         with open(file_path, 'rb') as f:
-            files = {'file': f}
+            files = {
+                'file': (os.path.basename(file_path), f, mime_type)
+            }
             data = {
                 'messaging_product': 'whatsapp',
                 'type': file_type
@@ -298,13 +350,14 @@ def upload_media_to_whatsapp(file_path, file_type):
         
         if response.status_code == 200:
             media_id = response.json().get('id')
-            return f"https://graph.facebook.com/v18.0/{media_id}"
+            print(f"✅ Media uploaded successfully, ID: {media_id}")
+            return media_id
         else:
-            print(f"Upload failed: {response.text}")
+            print(f"❌ Upload failed: {response.text}")
             return None
             
     except Exception as e:
-        print(f"Upload error: {e}")
+        print(f"❌ Upload error: {e}")
         return None
 
 # =========================
@@ -329,12 +382,13 @@ RULES:
 - Friendly and natural
 - Clear and direct
 - No long paragraphs
+- If something is asked outside the knowledge base, say you don't know
 
 KNOWLEDGE:
 {context}"""
 
         data = {
-            "model": "mistralai/mistral-7b-instruct",
+            "model": "openrouter/free",
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message}
@@ -355,7 +409,7 @@ KNOWLEDGE:
         return "Server busy. Please try again."
 
 # =========================
-# WEBHOOK
+# WEBHOOK - FIXED MODE HANDLING
 # =========================
 
 @app.route("/webhook", methods=["GET"])
@@ -373,48 +427,72 @@ def webhook():
             for entry in data["entry"]:
                 if "changes" in entry:
                     for change in entry["changes"]:
-                        if "value" in change and "messages" in change["value"]:
-                            for msg in change["value"]["messages"]:
-                                phone = msg["from"]
-                                msg_type = msg.get("type", "text")
-                                
-                                print(f"📩 {msg_type} from {phone}")
-                                
-                                save_user(phone)
-                                
-                                if msg_type == "text":
-                                    text = msg["text"]["body"]
-                                    save_message(phone, text, "user")
+                        if "value" in change:
+                            value = change["value"]
+                            
+                            if "statuses" in value:
+                                for status_update in value["statuses"]:
+                                    status = status_update.get("status")
+                                    message_id = status_update.get("id")
                                     
-                                    # Check mode and respond
-                                    conn = get_db()
-                                    cursor = conn.cursor()
-                                    cursor.execute("SELECT human_mode FROM users WHERE phone=?", (phone,))
-                                    row = cursor.fetchone()
-                                    conn.close()
+                                    if status and message_id:
+                                        print(f"📊 Status update: {message_id} -> {status}")
+                                        update_message_status(message_id, status)
+                            
+                            if "messages" in value:
+                                for msg in value["messages"]:
+                                    phone = msg["from"]
+                                    msg_type = msg.get("type", "text")
+                                    msg_id = msg.get("id")
                                     
-                                    mode = row[0] if row else 0
+                                    print(f"📩 {msg_type} from {phone}")
                                     
-                                    if mode == 0:
-                                        def process_ai():
-                                            reply = ask_ai(text)
-                                            if send_message(phone, reply):
-                                                save_message(phone, reply, "bot")
-                                            else:
-                                                save_message(phone, reply, "bot", status="failed")
+                                    # Save or update user
+                                    save_user(phone)
+                                    
+                                    if msg_type == "text":
+                                        text = msg["text"]["body"]
+                                        save_message(phone, text, "user", status="delivered", whatsapp_message_id=msg_id)
                                         
-                                        thread = threading.Thread(target=process_ai)
-                                        thread.daemon = True
-                                        thread.start()
-                                
-                                elif msg_type in ["image", "audio", "document"]:
-                                    # Handle media
-                                    media_id = msg[msg_type]["id"]
-                                    caption = msg[msg_type].get("caption", "")
-                                    mime_type = msg[msg_type].get("mime_type", "")
+                                        # IMPORTANT: Get mode AFTER saving message (to ensure latest mode)
+                                        mode = get_user_mode(phone)
+                                        
+                                        print(f"🤖 User {phone} mode: {'HUMAN' if mode == 1 else 'AI'}")
+                                        
+                                        # ONLY reply if mode is AI (0) and NOT Human (1)
+                                        if mode == 0:
+                                            def process_ai():
+                                                print(f"🤖 AI processing for {phone}")
+                                                reply = ask_ai(text)
+                                                success, whatsapp_msg_id = send_message(phone, reply)
+                                                if success:
+                                                    save_message(phone, reply, "bot", status="sent", whatsapp_message_id=whatsapp_msg_id)
+                                                    print(f"✅ AI reply sent to {phone}")
+                                                else:
+                                                    save_message(phone, reply, "bot", status="failed")
+                                                    print(f"❌ Failed to send AI reply to {phone}")
+                                            
+                                            thread = threading.Thread(target=process_ai)
+                                            thread.daemon = True
+                                            thread.start()
+                                        else:
+                                            print(f"👤 Human mode active for {phone} - AI reply skipped")
                                     
-                                    save_message(phone, caption or f"Sent a {msg_type}", "user", 
-                                               message_type=msg_type, media_mime_type=mime_type)
+                                    elif msg_type in ["image", "audio", "document"]:
+                                        media_info = msg[msg_type]
+                                        caption = media_info.get("caption", "")
+                                        
+                                        save_message(phone, caption or f"Sent a {msg_type}", "user", 
+                                                   message_type=msg_type, whatsapp_message_id=msg_id)
+                                    
+                                    elif msg_type == "button":
+                                        text = msg["button"]["text"]
+                                        save_message(phone, text, "user", status="delivered", whatsapp_message_id=msg_id)
+                                    
+                                    elif msg_type == "interactive":
+                                        if "list_reply" in msg["interactive"]:
+                                            text = msg["interactive"]["list_reply"]["title"]
+                                            save_message(phone, text, "user", status="delivered", whatsapp_message_id=msg_id)
                                     
     except Exception as e:
         print(f"Webhook error: {e}")
@@ -440,8 +518,9 @@ def get_users():
     rows = cursor.fetchall()
     conn.close()
     
-    return jsonify([
-        {
+    users_list = []
+    for r in rows:
+        users_list.append({
             "phone": r["phone"], 
             "human_mode": r["human_mode"], 
             "tags": r["tags"] or "",
@@ -449,9 +528,9 @@ def get_users():
             "total_messages": r["total_messages"] or 0,
             "last_seen": r["last_seen"],
             "last": r["last_message"] if r["last_message"] else "No messages"
-        }
-        for r in rows
-    ])
+        })
+    
+    return jsonify(users_list)
 
 @app.route("/messages/<phone>", methods=["GET"])
 def get_messages(phone):
@@ -473,18 +552,19 @@ def get_messages(phone):
     rows = cursor.fetchall()
     conn.close()
     
-    return jsonify([
-        {
-            "message": r["message"],
+    messages_list = []
+    for r in rows:
+        messages_list.append({
+            "message": r["message"] or "",
             "direction": r["direction"],
-            "status": r["status"],
+            "status": r["status"] if r["status"] else "sent",
             "timestamp": r["timestamp"],
-            "message_type": r["message_type"],
+            "message_type": r["message_type"] if r["message_type"] else "text",
             "media_path": r["media_path"],
             "file_name": r["file_name"]
-        }
-        for r in rows
-    ])
+        })
+    
+    return jsonify(messages_list)
 
 @app.route("/send", methods=["POST"])
 def send_panel():
@@ -495,32 +575,17 @@ def send_panel():
     if not phone or not message:
         return jsonify({"success": False, "error": "Phone and message required"}), 400
     
-    save_message(phone, message, "bot", status="sending")
+    success, whatsapp_msg_id = send_message(phone, message)
     
-    if send_message(phone, message):
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE messages SET status='sent' WHERE id=(SELECT MAX(id) FROM messages WHERE phone=? AND direction='bot')",
-            (phone,)
-        )
-        conn.commit()
-        conn.close()
-        return jsonify({"success": True})
+    if success:
+        save_message(phone, message, "bot", status="sent", whatsapp_message_id=whatsapp_msg_id)
+        return jsonify({"success": True, "message_id": whatsapp_msg_id})
     else:
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE messages SET status='failed' WHERE id=(SELECT MAX(id) FROM messages WHERE phone=? AND direction='bot')",
-            (phone,)
-        )
-        conn.commit()
-        conn.close()
+        save_message(phone, message, "bot", status="failed")
         return jsonify({"success": False, "error": "Failed to send"}), 500
 
 @app.route("/send-file", methods=["POST"])
 def send_file_endpoint():
-    """Endpoint to send files/images to WhatsApp"""
     if 'file' not in request.files:
         return jsonify({"success": False, "error": "No file provided"}), 400
     
@@ -535,30 +600,34 @@ def send_file_endpoint():
     if not allowed_file(file.filename):
         return jsonify({"success": False, "error": "File type not allowed"}), 400
     
-    # Save file temporarily
-    filename = secure_filename(f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}")
+    original_filename = file.filename
+    filename = secure_filename(f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{original_filename}")
     filepath = os.path.join(app.config['MEDIA_FOLDER'], filename)
     file.save(filepath)
     
-    # Determine file type for WhatsApp
     ext = filename.rsplit('.', 1)[1].lower()
-    if ext in ['jpg', 'jpeg', 'png', 'gif']:
+    if ext in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
         whatsapp_type = "image"
-    elif ext in ['mp3', 'wav']:
+    elif ext in ['mp3', 'wav', 'ogg']:
         whatsapp_type = "audio"
-    elif ext in ['pdf', 'doc', 'docx', 'txt']:
-        whatsapp_type = "document"
+    elif ext in ['mp4', 'mov', 'avi']:
+        whatsapp_type = "video"
     else:
         whatsapp_type = "document"
     
-    # Send file
-    success = send_file_message(phone, filepath, whatsapp_type)
+    caption = request.form.get("caption", f"Sent: {original_filename}")
+    success, whatsapp_msg_id = send_file_message(phone, filepath, whatsapp_type, caption)
     
     if success:
-        save_message(phone, f"Sent {whatsapp_type}: {file.filename}", "bot", 
-                    message_type=whatsapp_type, media_path=filepath, file_name=file.filename)
-        return jsonify({"success": True})
+        save_message(phone, caption, "bot", message_type=whatsapp_type, 
+                    media_path=filepath, file_name=original_filename, 
+                    whatsapp_message_id=whatsapp_msg_id)
+        return jsonify({"success": True, "message_id": whatsapp_msg_id})
     else:
+        try:
+            os.remove(filepath)
+        except:
+            pass
         return jsonify({"success": False, "error": "Failed to send file"}), 500
 
 @app.route("/toggle/<phone>", methods=["POST"])
@@ -580,6 +649,11 @@ def toggle_mode(phone):
     conn.commit()
     conn.close()
     
+    mode_text = "AI" if new == 0 else "HUMAN"
+    print(f"🔄 User {phone} switched to {mode_text} mode")
+    
+    socketio.emit('mode_changed', {'phone': phone, 'human_mode': new})
+    
     return jsonify({"human_mode": new})
 
 @app.route("/update-user", methods=["POST"])
@@ -589,10 +663,18 @@ def update_user():
     tags = data.get("tags")
     notes = data.get("notes")
     
+    conn = get_db()
+    cursor = conn.cursor()
+    
     if tags is not None:
-        update_user_tags(phone, tags)
+        cursor.execute("UPDATE users SET tags=? WHERE phone=?", (tags, phone))
     if notes is not None:
-        update_user_notes(phone, notes)
+        cursor.execute("UPDATE users SET notes=? WHERE phone=?", (notes, phone))
+    
+    conn.commit()
+    conn.close()
+    
+    socketio.emit('user_updated', {'phone': phone, 'tags': tags, 'notes': notes})
     
     return jsonify({"success": True})
 
@@ -601,7 +683,6 @@ def get_analytics():
     conn = get_db()
     cursor = conn.cursor()
     
-    # Basic stats
     cursor.execute("SELECT COUNT(*) FROM users")
     total_users = cursor.fetchone()[0]
     
@@ -618,15 +699,13 @@ def get_analytics():
     cursor.execute("SELECT COUNT(*) FROM messages WHERE timestamp LIKE ?", (f"{today}%",))
     messages_today = cursor.fetchone()[0]
     
-    # Message type distribution
     cursor.execute("""
         SELECT message_type, COUNT(*) as count
         FROM messages
         GROUP BY message_type
     """)
-    message_types = [{"type": r[0], "count": r[1]} for r in cursor.fetchall()]
+    message_types = [{"type": r[0] if r[0] else "text", "count": r[1]} for r in cursor.fetchall()]
     
-    # Engagement metrics
     cursor.execute("""
         SELECT phone, total_messages, last_seen 
         FROM users 
@@ -635,7 +714,6 @@ def get_analytics():
     """)
     top_users = [{"phone": r[0], "messages": r[1], "last_seen": r[2]} for r in cursor.fetchall()]
     
-    # Response time tracking
     cursor.execute("""
         SELECT 
             AVG(
@@ -653,18 +731,16 @@ def get_analytics():
     """)
     avg_response = cursor.fetchone()[0] or 0
     
-    # Most asked questions
     cursor.execute("""
         SELECT message, COUNT(*) as count
         FROM messages
-        WHERE direction = 'user' AND message_type = 'text'
+        WHERE direction = 'user' AND message_type = 'text' AND message != ''
         GROUP BY message
         ORDER BY count DESC
         LIMIT 10
     """)
     top_questions = [{"question": r[0], "count": r[1]} for r in cursor.fetchall()]
     
-    # Daily activity for last 7 days
     cursor.execute("""
         SELECT DATE(timestamp) as date, COUNT(*) as count
         FROM messages
@@ -673,25 +749,6 @@ def get_analytics():
         ORDER BY date
     """)
     daily_activity = [{"date": r[0], "messages": r[1]} for r in cursor.fetchall()]
-    
-    # Hourly activity
-    cursor.execute("""
-        SELECT STRFTIME('%H', timestamp) as hour, COUNT(*) as count
-        FROM messages
-        GROUP BY hour
-        ORDER BY hour
-    """)
-    hourly_activity = [{"hour": r[0], "messages": r[1]} for r in cursor.fetchall()]
-    
-    # User growth over time
-    cursor.execute("""
-        SELECT DATE(first_seen) as date, COUNT(*) as count
-        FROM users
-        WHERE DATE(first_seen) >= DATE('now', '-30 days')
-        GROUP BY DATE(first_seen)
-        ORDER BY date
-    """)
-    user_growth = [{"date": r[0], "new_users": r[1]} for r in cursor.fetchall()]
     
     conn.close()
     
@@ -705,9 +762,7 @@ def get_analytics():
         "message_types": message_types,
         "top_users": top_users,
         "top_questions": top_questions,
-        "daily_activity": daily_activity,
-        "hourly_activity": hourly_activity,
-        "user_growth": user_growth
+        "daily_activity": daily_activity
     })
 
 @app.route("/export/csv", methods=["GET"])
@@ -721,28 +776,29 @@ def export_csv():
             "SELECT message, direction, status, timestamp FROM messages WHERE phone=? ORDER BY id ASC",
             (phone,)
         )
-    else:
-        cursor.execute(
-            "SELECT phone, message, direction, status, timestamp FROM messages ORDER BY id ASC"
-        )
-    
-    rows = cursor.fetchall()
-    conn.close()
-    
-    output = StringIO()
-    writer = csv.writer(output)
-    
-    if phone:
+        rows = cursor.fetchall()
+        conn.close()
+        
+        output = StringIO()
+        writer = csv.writer(output)
         writer.writerow(['Message', 'Direction', 'Status', 'Timestamp'])
         for row in rows:
             writer.writerow([row[0], row[1], row[2], row[3]])
     else:
+        cursor.execute(
+            "SELECT phone, message, direction, status, timestamp FROM messages ORDER BY id ASC"
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        
+        output = StringIO()
+        writer = csv.writer(output)
         writer.writerow(['Phone', 'Message', 'Direction', 'Status', 'Timestamp'])
         for row in rows:
             writer.writerow([row[0], row[1], row[2], row[3], row[4]])
     
     output.seek(0)
-    filename = f"conversation_{phone if phone else 'all'}_{datetime.now().strftime('%Y%m%d')}.csv"
+    filename = f"conversation_{phone if phone else 'all'}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     
     return send_file(
         BytesIO(output.getvalue().encode()),
@@ -756,25 +812,34 @@ def health():
     return jsonify({
         "status": "ok",
         "whatsapp_configured": bool(WHATSAPP_TOKEN),
-        "openrouter_configured": bool(OPENROUTER_API_KEY)
+        "phone_number_id": bool(PHONE_NUMBER_ID),
+        "openrouter_configured": bool(OPENROUTER_API_KEY),
+        "timestamp": datetime.now().isoformat()
     })
 
-# =========================
-# RUN
-# =========================
+@app.route("/socket-test", methods=["GET"])
+def socket_test():
+    return jsonify({"message": "WebSocket is running on port 5000"})
+
+@app.route("/debug/mode/<phone>", methods=["GET"])
+def debug_mode(phone):
+    """Debug endpoint to check user mode"""
+    mode = get_user_mode(phone)
+    return jsonify({"phone": phone, "human_mode": mode})
 
 if __name__ == "__main__":
     print("\n" + "="*50)
-    print("🤖 WhatsApp Bot Server - Full Feature")
+    print("🤖 WhatsApp Bot Server - WebSocket Live Updates")
     print("="*50)
     print(f"📍 Webhook: http://localhost:5000/webhook")
     print(f"📍 Dashboard: http://localhost:3000")
-    print("\n📋 Features:")
-    print("   ✅ File & Image Sending")
-    print("   ✅ Advanced Analytics")
-    print("   ✅ Export Conversations")
-    print("   ✅ User Tags & Notes")
-    print("   ✅ Message Search")
+    print(f"📍 WebSocket: ws://localhost:5000/socket.io")
+    print(f"📍 Health: http://localhost:5000/health")
+    print(f"📍 Debug: http://localhost:5000/debug/mode/PHONE_NUMBER")
+    print("\n📋 Mode Control:")
+    print("   🔴 AI Mode = Bot auto-replies")
+    print("   🟢 Human Mode = Bot does NOT reply")
+    print("   ✅ Click 'Switch to Human' to disable AI")
     print("="*50 + "\n")
     
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    socketio.run(app, host="0.0.0.0", port=5000, debug=True, allow_unsafe_werkzeug=True)

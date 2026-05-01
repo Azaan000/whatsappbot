@@ -1,7 +1,13 @@
 /* eslint-disable react-hooks/exhaustive-deps */
 import React, { useEffect, useState, useRef } from "react";
+import io from "socket.io-client";
 
 const API = "http://localhost:5000";
+const socket = io(API, {
+  transports: ['websocket', 'polling'],
+  reconnection: true,
+  reconnectionAttempts: 10
+});
 
 export default function App() {
   const [users, setUsers] = useState([]);
@@ -22,40 +28,41 @@ export default function App() {
   const [userTags, setUserTags] = useState("");
   const [userNotes, setUserNotes] = useState("");
   const [selectedFile, setSelectedFile] = useState(null);
+  const [connected, setConnected] = useState(false);
+  const [typing, setTyping] = useState(false);
 
   const messagesEndRef = useRef(null);
   const modalRef = useRef(null);
   const fileInputRef = useRef(null);
 
-  // Load users
-  const loadUsers = async () => {
+  // =========================
+  // INITIAL DATA LOAD
+  // =========================
+  const loadInitialData = async () => {
     try {
-      const res = await fetch(`${API}/users`);
-      const data = await res.json();
-      setUsers(data);
+      const [usersRes, statsRes] = await Promise.all([
+        fetch(`${API}/users`),
+        fetch(`${API}/analytics`)
+      ]);
+      
+      const usersData = await usersRes.json();
+      const statsData = await statsRes.json();
+      
+      setUsers(usersData);
+      setStats(statsData);
       
       if (selectedPhone) {
-        const updated = data.find(u => u.phone === selectedPhone);
+        const updated = usersData.find(u => u.phone === selectedPhone);
         if (updated) setSelectedUser(updated);
       }
     } catch (err) {
-      console.error("Error loading users:", err);
+      console.error("Error loading initial data:", err);
     }
   };
 
-  // Load stats
-  const loadStats = async () => {
-    try {
-      const res = await fetch(`${API}/analytics`);
-      const data = await res.json();
-      setStats(data);
-    } catch (err) {
-      console.error("Error loading stats:", err);
-    }
-  };
-
-  // Load messages with search
+  // Load messages for selected user
   const loadMessages = async (phone, search = "") => {
+    if (!phone) return;
     setLoading(true);
     try {
       const url = search ? `${API}/messages/${phone}?search=${encodeURIComponent(search)}` : `${API}/messages/${phone}`;
@@ -69,21 +76,128 @@ export default function App() {
     }
   };
 
-  // Auto refresh
+  // =========================
+  // WEBSOCKET EVENTS (LIVE UPDATES)
+  // =========================
   useEffect(() => {
-    loadUsers();
-    loadStats();
-    const interval = setInterval(() => {
-      loadStats();
-      if (selectedPhone) loadMessages(selectedPhone, searchQuery);
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [selectedPhone, searchQuery]);
+    // Connection events
+    socket.on('connect', () => {
+      console.log('🟢 WebSocket connected');
+      setConnected(true);
+    });
 
-  // Auto scroll
+    socket.on('disconnect', () => {
+      console.log('🔴 WebSocket disconnected');
+      setConnected(false);
+    });
+
+    // New user joins - INSTANT update in sidebar
+    socket.on('new_user', (data) => {
+      console.log('🆕 New user joined:', data);
+      setUsers(prev => {
+        if (prev.find(u => u.phone === data.phone)) return prev;
+        return [data, ...prev];
+      });
+    });
+
+    // User data update (last message, message count, etc.) - INSTANT sidebar update
+    socket.on('user_update', (data) => {
+      console.log('📝 User update:', data);
+      setUsers(prev => prev.map(user => 
+        user.phone === data.phone ? { ...user, ...data } : user
+      ));
+      if (selectedPhone === data.phone) {
+        setSelectedUser(prev => ({ ...prev, ...data }));
+      }
+    });
+
+    // New message received - INSTANT chat update
+    socket.on('new_message', (data) => {
+      console.log('💬 New message:', data);
+      
+      // Update sidebar user list with last message
+      setUsers(prev => prev.map(user => 
+        user.phone === data.phone ? { 
+          ...user, 
+          last: data.message.substring(0, 50),
+          total_messages: (user.total_messages || 0) + 1,
+          last_seen: data.timestamp
+        } : user
+      ));
+      
+      // Add message to chat if this user is selected
+      if (selectedPhone === data.phone) {
+        // Show typing indicator for bot messages
+        if (data.direction === 'bot') {
+          setTyping(true);
+          setTimeout(() => setTyping(false), 1000);
+        }
+        
+        setMessages(prev => [...prev, {
+          message: data.message,
+          direction: data.direction,
+          status: data.status,
+          timestamp: data.timestamp,
+          message_type: data.message_type,
+          file_name: data.file_name
+        }]);
+      }
+    });
+
+    // Message status update (sent/delivered/read) - INSTANT status change
+    socket.on('status_update', (data) => {
+      console.log('✅ Status update:', data);
+      if (selectedPhone === data.phone) {
+        setMessages(prev => prev.map(msg => 
+          msg.whatsapp_message_id === data.whatsapp_message_id 
+            ? { ...msg, status: data.status }
+            : msg
+        ));
+      }
+    });
+
+    // Mode changed (AI/Human) - INSTANT mode update
+    socket.on('mode_changed', (data) => {
+      console.log('🔄 Mode changed:', data);
+      setUsers(prev => prev.map(user => 
+        user.phone === data.phone ? { ...user, human_mode: data.human_mode } : user
+      ));
+      if (selectedPhone === data.phone) {
+        setSelectedUser(prev => ({ ...prev, human_mode: data.human_mode }));
+      }
+    });
+
+    // User updated (tags/notes)
+    socket.on('user_updated', (data) => {
+      console.log('✏️ User updated:', data);
+      setUsers(prev => prev.map(user => 
+        user.phone === data.phone ? { ...user, tags: data.tags, notes: data.notes } : user
+      ));
+      if (selectedPhone === data.phone) {
+        setSelectedUser(prev => ({ ...prev, tags: data.tags, notes: data.notes }));
+      }
+    });
+
+    // Load initial data on mount
+    loadInitialData();
+
+    // Cleanup on unmount
+    return () => {
+      socket.off('connect');
+      socket.off('disconnect');
+      socket.off('new_user');
+      socket.off('user_update');
+      socket.off('new_message');
+      socket.off('status_update');
+      socket.off('mode_changed');
+      socket.off('user_updated');
+    };
+  }, [selectedPhone]);
+
+  // Auto scroll to bottom when messages change
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [messages, typing]);
 
   // Close modal on outside click
   useEffect(() => {
@@ -132,14 +246,14 @@ export default function App() {
         body: JSON.stringify({ phone: selectedPhone, message: messageText })
       });
       
-      if (res.ok) {
-        setTimeout(() => loadMessages(selectedPhone, searchQuery), 500);
-      } else {
+      if (!res.ok) {
         alert("Failed to send message");
+        setMessages(prev => prev.filter(msg => msg !== tempMsg));
       }
     } catch (err) {
       console.error("Send error:", err);
       alert("Error sending message");
+      setMessages(prev => prev.filter(msg => msg !== tempMsg));
     } finally {
       setSending(false);
     }
@@ -156,7 +270,7 @@ export default function App() {
     setSending(true);
     
     const tempMsg = {
-      message: `Sending ${selectedFile.name}`,
+      message: `Sending ${selectedFile.name}...`,
       direction: "bot",
       status: "sending",
       timestamp: new Date().toISOString(),
@@ -171,14 +285,15 @@ export default function App() {
         body: formData
       });
       
-      if (res.ok) {
-        setTimeout(() => loadMessages(selectedPhone, searchQuery), 500);
-      } else {
-        alert("Failed to send file");
+      if (!res.ok) {
+        const error = await res.json();
+        alert(error.error || "Failed to send file");
+        setMessages(prev => prev.filter(msg => msg !== tempMsg));
       }
     } catch (err) {
       console.error("Send file error:", err);
       alert("Error sending file");
+      setMessages(prev => prev.filter(msg => msg !== tempMsg));
     } finally {
       setSending(false);
       setSelectedFile(null);
@@ -199,7 +314,7 @@ export default function App() {
     }
 
     const confirmed = window.confirm(
-      `Are you sure you want to send this message to ${users.length} user(s)?\n\nMessage: "${broadcastMessage}"`
+      `Send to ${users.length} user(s)?\n\n"${broadcastMessage}"`
     );
 
     if (!confirmed) return;
@@ -227,7 +342,6 @@ export default function App() {
           failCount++;
         }
       } catch (err) {
-        console.error(`Failed to send to ${user.phone}:`, err);
         failCount++;
       }
       
@@ -238,11 +352,7 @@ export default function App() {
     setShowBroadcast(false);
     setBroadcastMessage("");
     
-    alert(`Broadcast completed!\n✅ Sent: ${successCount}\n❌ Failed: ${failCount}`);
-    
-    if (selectedPhone) {
-      loadMessages(selectedPhone, searchQuery);
-    }
+    alert(`Broadcast complete!\n✅ Sent: ${successCount}\n❌ Failed: ${failCount}`);
   };
 
   // Toggle mode
@@ -254,7 +364,9 @@ export default function App() {
       const data = await res.json();
       if (data.human_mode !== undefined) {
         setSelectedUser(prev => ({ ...prev, human_mode: data.human_mode }));
-        loadUsers();
+        setUsers(prev => prev.map(user => 
+          user.phone === selectedPhone ? { ...user, human_mode: data.human_mode } : user
+        ));
       }
     } catch (err) {
       console.error("Toggle error:", err);
@@ -271,7 +383,6 @@ export default function App() {
       });
       alert("User updated successfully!");
       setEditingUser(null);
-      loadUsers();
     } catch (err) {
       console.error("Update error:", err);
       alert("Failed to update user");
@@ -284,15 +395,43 @@ export default function App() {
     window.open(url, '_blank');
   };
 
+  // Refresh stats (only stats, not users/messages)
+  const refreshStats = async () => {
+    try {
+      const res = await fetch(`${API}/analytics`);
+      const data = await res.json();
+      setStats(data);
+    } catch (err) {
+      console.error("Error refreshing stats:", err);
+    }
+  };
+
+  // Refresh stats every 30 seconds (only for analytics, not for live data)
+  useEffect(() => {
+    refreshStats();
+    const interval = setInterval(refreshStats, 30000);
+    return () => clearInterval(interval);
+  }, []);
+
   // Get status icon
   const getStatusIcon = (status) => {
     switch(status) {
       case 'sent': return '✓';
       case 'delivered': return '✓✓';
-      case 'read': return '✓✓';
+      case 'read': return '✓✓✓';
       case 'sending': return '⋯';
       case 'failed': return '⚠️';
       default: return '';
+    }
+  };
+
+  // Get status color
+  const getStatusColor = (status) => {
+    switch(status) {
+      case 'read': return '#4caf50';
+      case 'delivered': return '#2196f3';
+      case 'sent': return '#666';
+      default: return '#999';
     }
   };
 
@@ -302,6 +441,7 @@ export default function App() {
       case 'image': return '🖼️';
       case 'audio': return '🎵';
       case 'document': return '📄';
+      case 'video': return '🎬';
       case 'file': return '📎';
       default: return '💬';
     }
@@ -309,6 +449,15 @@ export default function App() {
 
   return (
     <div style={styles.app}>
+      {/* Connection Status Indicator */}
+      <div style={{
+        ...styles.liveIndicator,
+        background: connected ? '#4caf50' : '#f44336'
+      }}>
+        <span style={styles.liveDot}></span>
+        {connected ? 'Live' : 'Reconnecting...'}
+      </div>
+
       {/* Analytics Bar */}
       <div style={styles.analyticsBar}>
         <div style={styles.statItem}>👥 Users: {stats.total_users || 0}</div>
@@ -318,7 +467,7 @@ export default function App() {
         <div style={styles.statItem}>📅 Today: {stats.messages_today || 0}</div>
         <div style={styles.statItem}>⏱️ Response: {stats.avg_response_time || 0} min</div>
         <button style={styles.analyticsBtn} onClick={() => setShowAnalytics(true)}>
-          📊 View Analytics
+          📊 Analytics
         </button>
         <button style={styles.broadcastBtn} onClick={() => setShowBroadcast(true)}>
           📢 Broadcast
@@ -326,22 +475,28 @@ export default function App() {
       </div>
 
       <div style={styles.container}>
-        {/* Sidebar */}
+        {/* Sidebar - UPDATES LIVE VIA WEBSOCKET */}
         <div style={styles.sidebar}>
           <h2 style={styles.title}>WhatsApp Dashboard</h2>
-          <div style={styles.userCount}>{users.length} Chats</div>
+          <div style={styles.userCount}>
+            {users.length} Chats • {connected ? 'Live' : 'Connecting...'}
+          </div>
           
           <button style={styles.exportAllBtn} onClick={() => exportConversation()}>
             📥 Export All Conversations
           </button>
           
           <div style={styles.userList}>
+            {users.length === 0 && (
+              <div style={styles.noUsers}>No users yet. Wait for incoming messages...</div>
+            )}
             {users.map((user, i) => (
               <div
                 key={i}
                 style={{
                   ...styles.user,
-                  background: selectedPhone === user.phone ? "#e3f2fd" : "transparent"
+                  background: selectedPhone === user.phone ? "#e3f2fd" : "transparent",
+                  borderLeft: selectedPhone === user.phone ? "3px solid #0b5cff" : "3px solid transparent"
                 }}
                 onClick={() => selectUser(user)}
               >
@@ -350,7 +505,12 @@ export default function App() {
                   <span>📨 {user.total_messages || 0}</span>
                   {user.tags && <span style={styles.userTag}>🏷️ {user.tags}</span>}
                 </div>
-                <div style={styles.userLast}>{user.last || "No messages"}</div>
+                <div style={styles.userLast}>
+                  {user.last || "No messages yet"}
+                </div>
+                <div style={styles.userTime}>
+                  {user.last_seen && `Last: ${new Date(user.last_seen).toLocaleTimeString()}`}
+                </div>
                 <div style={{
                   ...styles.userMode,
                   color: user.human_mode ? "#ff9800" : "#4caf50"
@@ -374,6 +534,7 @@ export default function App() {
                       {selectedUser.human_mode ? "👤 Human Mode" : "🤖 AI Mode"}
                     </span>
                     {selectedUser.tags && <span style={styles.tagBadge}>🏷️ {selectedUser.tags}</span>}
+                    <span style={styles.messageCount}>📨 {selectedUser.total_messages} messages</span>
                   </div>
                 </div>
                 <div style={styles.headerButtons}>
@@ -412,6 +573,10 @@ export default function App() {
               <div style={styles.messagesArea}>
                 {loading && <div style={styles.loading}>Loading...</div>}
                 
+                {messages.length === 0 && !loading && (
+                  <div style={styles.noMessages}>No messages yet. Send a message to start the conversation!</div>
+                )}
+                
                 {messages.map((msg, i) => (
                   <div
                     key={i}
@@ -430,11 +595,26 @@ export default function App() {
                     <div style={styles.time}>
                       {msg.timestamp ? new Date(msg.timestamp).toLocaleTimeString() : ''}
                       {msg.direction === "bot" && (
-                        <span style={{ marginLeft: 5 }}>{getStatusIcon(msg.status)}</span>
+                        <span style={{ marginLeft: 5, color: getStatusColor(msg.status) }}>
+                          {getStatusIcon(msg.status)}
+                        </span>
                       )}
                     </div>
                   </div>
                 ))}
+                
+                {/* Typing indicator */}
+                {typing && (
+                  <div style={{
+                    ...styles.bubble,
+                    alignSelf: "flex-end",
+                    background: "#0b5cff",
+                    color: "#fff",
+                    opacity: 0.7
+                  }}>
+                    <div>typing...</div>
+                  </div>
+                )}
                 
                 <div ref={messagesEndRef} />
               </div>
@@ -445,11 +625,11 @@ export default function App() {
                   ref={fileInputRef}
                   onChange={(e) => setSelectedFile(e.target.files[0])}
                   style={styles.fileInput}
-                  accept="image/*,application/pdf,audio/*"
+                  accept="image/*,application/pdf,audio/*,.doc,.docx,.txt"
                 />
                 {selectedFile && (
                   <button style={styles.sendFileBtn} onClick={sendFile} disabled={sending}>
-                    📎 Send File
+                    📎 Send ({selectedFile.name})
                   </button>
                 )}
                 <input
@@ -461,7 +641,7 @@ export default function App() {
                   disabled={sending}
                 />
                 <button style={styles.sendBtn} onClick={sendMessage} disabled={sending || !text.trim()}>
-                  {sending ? 'Sending...' : 'Send'}
+                  {sending ? '...' : 'Send'}
                 </button>
               </div>
             </>
@@ -469,6 +649,7 @@ export default function App() {
             <div style={styles.empty}>
               <div>💬</div>
               <div>Select a chat to start messaging</div>
+              <div style={styles.emptySub}>New users appear instantly in the sidebar</div>
             </div>
           )}
         </div>
@@ -508,7 +689,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Analytics Modal - Beautiful Presentation */}
+      {/* Analytics Modal */}
       {showAnalytics && (
         <div style={modalStyles.overlay}>
           <div ref={modalRef} style={{...modalStyles.modal, width: "800px", maxHeight: "80vh"}}>
@@ -518,7 +699,6 @@ export default function App() {
             </div>
             <div style={{...modalStyles.body, maxHeight: "calc(80vh - 120px)", overflowY: "auto"}}>
               
-              {/* Key Metrics Cards */}
               <div style={analyticsStyles.cardsGrid}>
                 <div style={analyticsStyles.card}>
                   <div style={analyticsStyles.cardIcon}>👥</div>
@@ -542,7 +722,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Mode Distribution */}
               <div style={analyticsStyles.section}>
                 <h3>🤖 Mode Distribution</h3>
                 <div style={analyticsStyles.statsRow}>
@@ -563,7 +742,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Message Types */}
               {stats.message_types && stats.message_types.length > 0 && (
                 <div style={analyticsStyles.section}>
                   <h3>📨 Message Types Distribution</h3>
@@ -581,7 +759,6 @@ export default function App() {
                 </div>
               )}
 
-              {/* Daily Activity */}
               {stats.daily_activity && stats.daily_activity.length > 0 && (
                 <div style={analyticsStyles.section}>
                   <h3>📈 Daily Activity (Last 7 Days)</h3>
@@ -603,7 +780,6 @@ export default function App() {
                 </div>
               )}
 
-              {/* Top Users */}
               {stats.top_users && stats.top_users.length > 0 && (
                 <div style={analyticsStyles.section}>
                   <h3>🏆 Top Active Users</h3>
@@ -621,7 +797,6 @@ export default function App() {
                 </div>
               )}
 
-              {/* Most Asked Questions */}
               {stats.top_questions && stats.top_questions.length > 0 && (
                 <div style={analyticsStyles.section}>
                   <h3>❓ Most Asked Questions</h3>
@@ -630,21 +805,6 @@ export default function App() {
                       <div key={i} style={analyticsStyles.questionItem}>
                         <div style={analyticsStyles.questionText}>"{q.question}"</div>
                         <div style={analyticsStyles.questionCount}>Asked {q.count} times</div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Hourly Activity */}
-              {stats.hourly_activity && stats.hourly_activity.length > 0 && (
-                <div style={analyticsStyles.section}>
-                  <h3>⏰ Activity by Hour</h3>
-                  <div style={analyticsStyles.hourlyGrid}>
-                    {stats.hourly_activity.map((hour, i) => (
-                      <div key={i} style={analyticsStyles.hourItem}>
-                        <div>{hour.hour}:00</div>
-                        <div style={analyticsStyles.hourCount}>{hour.messages}</div>
                       </div>
                     ))}
                   </div>
@@ -701,6 +861,27 @@ export default function App() {
 
 const styles = {
   app: { backgroundColor: "#f5f5f5", minHeight: "100vh" },
+  liveIndicator: {
+    position: "fixed",
+    bottom: "10px",
+    right: "10px",
+    color: "#fff",
+    padding: "5px 10px",
+    borderRadius: "20px",
+    fontSize: "11px",
+    display: "flex",
+    alignItems: "center",
+    gap: "5px",
+    zIndex: 999,
+    boxShadow: "0 2px 5px rgba(0,0,0,0.2)"
+  },
+  liveDot: {
+    width: "8px",
+    height: "8px",
+    background: "#fff",
+    borderRadius: "50%",
+    animation: "pulse 1s infinite"
+  },
   analyticsBar: {
     display: "flex",
     gap: "20px",
@@ -716,21 +897,24 @@ const styles = {
   analyticsBtn: { padding: "6px 14px", background: "#fff", color: "#667eea", border: "none", borderRadius: "20px", cursor: "pointer", fontWeight: "500" },
   broadcastBtn: { padding: "6px 14px", background: "#ff9800", color: "#fff", border: "none", borderRadius: "20px", cursor: "pointer", fontWeight: "500" },
   container: { display: "flex", height: "calc(100vh - 60px)" },
-  sidebar: { width: "300px", background: "#fff", borderRight: "1px solid #e0e0e0", display: "flex", flexDirection: "column" },
+  sidebar: { width: "320px", background: "#fff", borderRight: "1px solid #e0e0e0", display: "flex", flexDirection: "column" },
   title: { padding: "20px", margin: 0, fontSize: "18px", color: "#333", borderBottom: "1px solid #e0e0e0" },
   userCount: { padding: "10px 20px", fontSize: "12px", color: "#666", borderBottom: "1px solid #e0e0e0" },
   exportAllBtn: { margin: "10px 20px", padding: "8px", background: "#4caf50", color: "#fff", border: "none", borderRadius: "8px", cursor: "pointer" },
   userList: { flex: 1, overflowY: "auto", padding: "10px" },
+  noUsers: { textAlign: "center", padding: "40px", color: "#999", fontSize: "13px" },
   user: { padding: "12px", marginBottom: "8px", borderRadius: "10px", cursor: "pointer", transition: "all 0.2s" },
   userPhone: { fontWeight: "bold", fontSize: "13px", marginBottom: "4px", color: "#333" },
   userStats: { fontSize: "11px", display: "flex", gap: "10px", marginBottom: "4px", color: "#666" },
   userTag: { background: "#e3f2fd", padding: "2px 6px", borderRadius: "10px", fontSize: "10px" },
-  userLast: { fontSize: "11px", color: "#999", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  userLast: { fontSize: "11px", color: "#999", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", marginBottom: "2px" },
+  userTime: { fontSize: "10px", color: "#aaa", marginBottom: "2px" },
   userMode: { fontSize: "10px", marginTop: "4px", fontWeight: "500" },
   chat: { flex: 1, display: "flex", flexDirection: "column", background: "#f0f2f5" },
   header: { padding: "15px 20px", background: "#fff", borderBottom: "1px solid #e0e0e0", display: "flex", justifyContent: "space-between", alignItems: "center" },
-  headerInfo: { display: "flex", gap: "10px", alignItems: "center", marginTop: "5px" },
+  headerInfo: { display: "flex", gap: "10px", alignItems: "center", marginTop: "5px", flexWrap: "wrap" },
   tagBadge: { background: "#e3f2fd", padding: "2px 8px", borderRadius: "12px", fontSize: "11px", color: "#0b5cff" },
+  messageCount: { fontSize: "11px", color: "#666" },
   headerButtons: { display: "flex", gap: "10px" },
   toggleBtn: { padding: "8px 16px", background: "#0b5cff", color: "#fff", border: "none", borderRadius: "8px", cursor: "pointer" },
   editBtn: { padding: "8px 16px", background: "#ff9800", color: "#fff", border: "none", borderRadius: "8px", cursor: "pointer" },
@@ -740,18 +924,30 @@ const styles = {
   clearSearch: { position: "absolute", right: "30px", top: "18px", background: "none", border: "none", cursor: "pointer", color: "#999" },
   messagesArea: { flex: 1, padding: "20px", display: "flex", flexDirection: "column", gap: "8px", overflowY: "auto", backgroundColor: "#efeae2" },
   loading: { textAlign: "center", color: "#666", padding: "20px" },
+  noMessages: { textAlign: "center", color: "#999", padding: "40px" },
   bubble: { padding: "8px 12px", borderRadius: "12px", maxWidth: "60%", fontSize: "14px", wordWrap: "break-word", boxShadow: "0 1px 1px rgba(0,0,0,0.1)" },
   bubbleHeader: { display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" },
   bubbleText: { wordBreak: "break-word" },
   fileName: { fontSize: "11px", opacity: 0.8, fontStyle: "italic" },
   time: { fontSize: "10px", marginTop: "4px", opacity: 0.7, textAlign: "right" },
-  inputArea: { display: "flex", padding: "15px 20px", background: "#fff", borderTop: "1px solid #ddd", gap: "10px", alignItems: "center" },
+  inputArea: { display: "flex", padding: "15px 20px", background: "#fff", borderTop: "1px solid #ddd", gap: "10px", alignItems: "center", flexWrap: "wrap" },
   fileInput: { padding: "5px", border: "1px solid #ddd", borderRadius: "5px", fontSize: "12px" },
-  sendFileBtn: { padding: "10px 15px", background: "#9c27b0", color: "#fff", border: "none", borderRadius: "20px", cursor: "pointer" },
-  input: { flex: 1, padding: "10px 15px", borderRadius: "20px", border: "1px solid #ddd", outline: "none" },
+  sendFileBtn: { padding: "10px 15px", background: "#9c27b0", color: "#fff", border: "none", borderRadius: "20px", cursor: "pointer", fontSize: "12px" },
+  input: { flex: 1, padding: "10px 15px", borderRadius: "20px", border: "1px solid #ddd", outline: "none", minWidth: "150px" },
   sendBtn: { padding: "10px 20px", background: "#0b5cff", color: "#fff", border: "none", borderRadius: "20px", cursor: "pointer" },
-  empty: { flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "10px", color: "#888" }
+  empty: { flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "10px", color: "#888" },
+  emptySub: { fontSize: "12px", color: "#aaa", marginTop: "5px" }
 };
+
+// Add animation
+const styleSheet = document.createElement("style");
+styleSheet.textContent = `
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+`;
+document.head.appendChild(styleSheet);
 
 const modalStyles = {
   overlay: { position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 },
@@ -802,8 +998,5 @@ const analyticsStyles = {
   questionsList: { display: "flex", flexDirection: "column", gap: "8px" },
   questionItem: { padding: "10px", background: "#fff", borderRadius: "8px" },
   questionText: { fontSize: "13px", color: "#333", marginBottom: "5px" },
-  questionCount: { fontSize: "11px", color: "#0b5cff" },
-  hourlyGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(80px, 1fr))", gap: "8px" },
-  hourItem: { padding: "8px", background: "#fff", borderRadius: "8px", textAlign: "center", fontSize: "12px" },
-  hourCount: { fontSize: "16px", fontWeight: "bold", color: "#0b5cff", marginTop: "4px" }
+  questionCount: { fontSize: "11px", color: "#0b5cff" }
 };
