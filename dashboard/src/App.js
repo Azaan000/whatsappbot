@@ -30,6 +30,10 @@ export default function App() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [connected, setConnected] = useState(false);
   const [typing, setTyping] = useState(false);
+  
+  // Track unread messages per user
+  const [unreadCounts, setUnreadCounts] = useState({});
+  const [highlightedUsers, setHighlightedUsers] = useState(new Set());
 
   const messagesEndRef = useRef(null);
   const modalRef = useRef(null);
@@ -51,6 +55,13 @@ export default function App() {
       setUsers(usersData);
       setStats(statsData);
       
+      // Initialize unread counts for all users (all messages considered unread initially)
+      const initialUnread = {};
+      usersData.forEach(user => {
+        initialUnread[user.phone] = 0;
+      });
+      setUnreadCounts(initialUnread);
+      
       if (selectedPhone) {
         const updated = usersData.find(u => u.phone === selectedPhone);
         if (updated) setSelectedUser(updated);
@@ -69,6 +80,9 @@ export default function App() {
       const res = await fetch(url);
       const data = await res.json();
       setMessages(data);
+      
+      // When user is selected, mark their messages as read
+      markAsRead(phone);
     } catch (err) {
       console.error("Error loading messages:", err);
     } finally {
@@ -76,11 +90,41 @@ export default function App() {
     }
   };
 
+  // Mark user's messages as read
+  const markAsRead = (phone) => {
+    if (unreadCounts[phone] && unreadCounts[phone] > 0) {
+      setUnreadCounts(prev => ({
+        ...prev,
+        [phone]: 0
+      }));
+      
+      // Remove from highlighted users set
+      setHighlightedUsers(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(phone);
+        return newSet;
+      });
+    }
+  };
+
+  // Increment unread count for a user
+  const incrementUnread = (phone) => {
+    // Don't increment if this is the currently selected chat
+    if (selectedPhone === phone) return;
+    
+    setUnreadCounts(prev => ({
+      ...prev,
+      [phone]: (prev[phone] || 0) + 1
+    }));
+    
+    // Add to highlighted users set
+    setHighlightedUsers(prev => new Set(prev).add(phone));
+  };
+
   // =========================
   // WEBSOCKET EVENTS (LIVE UPDATES)
   // =========================
   useEffect(() => {
-    // Connection events
     socket.on('connect', () => {
       console.log('🟢 WebSocket connected');
       setConnected(true);
@@ -91,16 +135,20 @@ export default function App() {
       setConnected(false);
     });
 
-    // New user joins - INSTANT update in sidebar
     socket.on('new_user', (data) => {
       console.log('🆕 New user joined:', data);
       setUsers(prev => {
         if (prev.find(u => u.phone === data.phone)) return prev;
         return [data, ...prev];
       });
+      // Initialize unread count for new user
+      setUnreadCounts(prev => ({
+        ...prev,
+        [data.phone]: 1 // New user's first message is unread
+      }));
+      setHighlightedUsers(prev => new Set(prev).add(data.phone));
     });
 
-    // User data update (last message, message count, etc.) - INSTANT sidebar update
     socket.on('user_update', (data) => {
       console.log('📝 User update:', data);
       setUsers(prev => prev.map(user => 
@@ -111,9 +159,13 @@ export default function App() {
       }
     });
 
-    // New message received - INSTANT chat update
     socket.on('new_message', (data) => {
       console.log('💬 New message:', data);
+      
+      // If this is a user message (incoming), increment unread count
+      if (data.direction === 'user') {
+        incrementUnread(data.phone);
+      }
       
       // Update sidebar user list with last message
       setUsers(prev => prev.map(user => 
@@ -127,7 +179,6 @@ export default function App() {
       
       // Add message to chat if this user is selected
       if (selectedPhone === data.phone) {
-        // Show typing indicator for bot messages
         if (data.direction === 'bot') {
           setTyping(true);
           setTimeout(() => setTyping(false), 1000);
@@ -141,10 +192,14 @@ export default function App() {
           message_type: data.message_type,
           file_name: data.file_name
         }]);
+        
+        // If message is from user and we're in this chat, mark as read
+        if (data.direction === 'user') {
+          markAsRead(data.phone);
+        }
       }
     });
 
-    // Message status update (sent/delivered/read) - INSTANT status change
     socket.on('status_update', (data) => {
       console.log('✅ Status update:', data);
       if (selectedPhone === data.phone) {
@@ -156,7 +211,6 @@ export default function App() {
       }
     });
 
-    // Mode changed (AI/Human) - INSTANT mode update
     socket.on('mode_changed', (data) => {
       console.log('🔄 Mode changed:', data);
       setUsers(prev => prev.map(user => 
@@ -167,7 +221,6 @@ export default function App() {
       }
     });
 
-    // User updated (tags/notes)
     socket.on('user_updated', (data) => {
       console.log('✏️ User updated:', data);
       setUsers(prev => prev.map(user => 
@@ -178,10 +231,8 @@ export default function App() {
       }
     });
 
-    // Load initial data on mount
     loadInitialData();
 
-    // Cleanup on unmount
     return () => {
       socket.off('connect');
       socket.off('disconnect');
@@ -214,12 +265,13 @@ export default function App() {
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [showBroadcast, showAnalytics, editingUser]);
 
-  // Select user
+  // Select user - mark as read when clicked
   const selectUser = (user) => {
     setSelectedPhone(user.phone);
     setSelectedUser(user);
     setSearchQuery("");
     loadMessages(user.phone);
+    markAsRead(user.phone);
   };
 
   // Send message
@@ -395,7 +447,7 @@ export default function App() {
     window.open(url, '_blank');
   };
 
-  // Refresh stats (only stats, not users/messages)
+  // Refresh stats
   const refreshStats = async () => {
     try {
       const res = await fetch(`${API}/analytics`);
@@ -406,7 +458,6 @@ export default function App() {
     }
   };
 
-  // Refresh stats every 30 seconds (only for analytics, not for live data)
   useEffect(() => {
     refreshStats();
     const interval = setInterval(refreshStats, 30000);
@@ -475,7 +526,7 @@ export default function App() {
       </div>
 
       <div style={styles.container}>
-        {/* Sidebar - UPDATES LIVE VIA WEBSOCKET */}
+        {/* Sidebar - WITH UNREAD HIGHLIGHTING */}
         <div style={styles.sidebar}>
           <h2 style={styles.title}>WhatsApp Dashboard</h2>
           <div style={styles.userCount}>
@@ -490,35 +541,58 @@ export default function App() {
             {users.length === 0 && (
               <div style={styles.noUsers}>No users yet. Wait for incoming messages...</div>
             )}
-            {users.map((user, i) => (
-              <div
-                key={i}
-                style={{
-                  ...styles.user,
-                  background: selectedPhone === user.phone ? "#e3f2fd" : "transparent",
-                  borderLeft: selectedPhone === user.phone ? "3px solid #0b5cff" : "3px solid transparent"
-                }}
-                onClick={() => selectUser(user)}
-              >
-                <div style={styles.userPhone}>{user.phone}</div>
-                <div style={styles.userStats}>
-                  <span>📨 {user.total_messages || 0}</span>
-                  {user.tags && <span style={styles.userTag}>🏷️ {user.tags}</span>}
+            {users.map((user, i) => {
+              const isUnread = highlightedUsers.has(user.phone);
+              const unreadCount = unreadCounts[user.phone] || 0;
+              
+              return (
+                <div
+                  key={i}
+                  style={{
+                    ...styles.user,
+                    background: selectedPhone === user.phone 
+                      ? "#e3f2fd" 
+                      : isUnread 
+                        ? "#fff3e0"  // Orange highlight for unread
+                        : "transparent",
+                    borderLeft: selectedPhone === user.phone 
+                      ? "3px solid #0b5cff" 
+                      : isUnread 
+                        ? "3px solid #ff9800" 
+                        : "3px solid transparent",
+                    fontWeight: isUnread ? "bold" : "normal"
+                  }}
+                  onClick={() => selectUser(user)}
+                >
+                  <div style={styles.userHeader}>
+                    <div style={styles.userPhone}>{user.phone}</div>
+                    {unreadCount > 0 && (
+                      <div style={styles.unreadBadge}>{unreadCount}</div>
+                    )}
+                  </div>
+                  <div style={styles.userStats}>
+                    <span>📨 {user.total_messages || 0}</span>
+                    {user.tags && <span style={styles.userTag}>🏷️ {user.tags}</span>}
+                  </div>
+                  <div style={{
+                    ...styles.userLast,
+                    color: isUnread ? "#ff9800" : "#999",
+                    fontWeight: isUnread ? "500" : "normal"
+                  }}>
+                    {user.last || "No messages yet"}
+                  </div>
+                  <div style={styles.userTime}>
+                    {user.last_seen && `Last: ${new Date(user.last_seen).toLocaleTimeString()}`}
+                  </div>
+                  <div style={{
+                    ...styles.userMode,
+                    color: user.human_mode ? "#ff9800" : "#4caf50"
+                  }}>
+                    {user.human_mode ? "👤 HUMAN" : "🤖 AI"}
+                  </div>
                 </div>
-                <div style={styles.userLast}>
-                  {user.last || "No messages yet"}
-                </div>
-                <div style={styles.userTime}>
-                  {user.last_seen && `Last: ${new Date(user.last_seen).toLocaleTimeString()}`}
-                </div>
-                <div style={{
-                  ...styles.userMode,
-                  color: user.human_mode ? "#ff9800" : "#4caf50"
-                }}>
-                  {user.human_mode ? "👤 HUMAN" : "🤖 AI"}
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
 
@@ -603,7 +677,6 @@ export default function App() {
                   </div>
                 ))}
                 
-                {/* Typing indicator */}
                 {typing && (
                   <div style={{
                     ...styles.bubble,
@@ -904,10 +977,21 @@ const styles = {
   userList: { flex: 1, overflowY: "auto", padding: "10px" },
   noUsers: { textAlign: "center", padding: "40px", color: "#999", fontSize: "13px" },
   user: { padding: "12px", marginBottom: "8px", borderRadius: "10px", cursor: "pointer", transition: "all 0.2s" },
-  userPhone: { fontWeight: "bold", fontSize: "13px", marginBottom: "4px", color: "#333" },
+  userHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" },
+  userPhone: { fontWeight: "bold", fontSize: "13px", color: "#333" },
+  unreadBadge: {
+    background: "#ff9800",
+    color: "#fff",
+    borderRadius: "12px",
+    padding: "2px 8px",
+    fontSize: "10px",
+    fontWeight: "bold",
+    minWidth: "20px",
+    textAlign: "center"
+  },
   userStats: { fontSize: "11px", display: "flex", gap: "10px", marginBottom: "4px", color: "#666" },
   userTag: { background: "#e3f2fd", padding: "2px 6px", borderRadius: "10px", fontSize: "10px" },
-  userLast: { fontSize: "11px", color: "#999", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", marginBottom: "2px" },
+  userLast: { fontSize: "11px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", marginBottom: "2px" },
   userTime: { fontSize: "10px", color: "#aaa", marginBottom: "2px" },
   userMode: { fontSize: "10px", marginTop: "4px", fontWeight: "500" },
   chat: { flex: 1, display: "flex", flexDirection: "column", background: "#f0f2f5" },
